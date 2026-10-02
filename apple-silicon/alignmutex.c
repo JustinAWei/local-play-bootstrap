@@ -1,9 +1,10 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -11,11 +12,25 @@
    fault (SIGBUS) when the operand crosses a 16-byte boundary; x86 does not.
    SC2 4.10 keeps pthread mutexes at 2-byte-aligned addresses, so glibc's
    pthread_mutex_lock dies at map load. Route every misaligned mutex to an
-   aligned shadow mutex; aligned mutexes pass straight through. */
+   aligned shadow mutex; aligned mutexes pass straight through.
 
-#define TABLE (1 << 16)
-struct slot { uintptr_t key; pthread_mutex_t *shadow; };
-static struct slot table[TABLE];
+   Shadows live in a chained hash table keyed by the mutex address. An entry
+   is removed (and its shadow freed) by pthread_mutex_destroy or a re-init of
+   the same address, so the table holds only live misaligned mutexes.
+
+   Limits: a shadow is process-private and keeps only the mutex type
+   (normal/recursive/errorcheck/adaptive). Process-shared, robust and
+   priority-inheritance attributes are not carried over. */
+
+#define BUCKETS 4096 /* power of two */
+
+struct entry {
+    uintptr_t key;
+    pthread_mutex_t shadow;
+    struct entry *next;
+};
+
+static struct entry *buckets[BUCKETS];
 static pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int (*r_init)(pthread_mutex_t *, const pthread_mutexattr_t *);
@@ -44,70 +59,102 @@ __attribute__((constructor)) static void setup(void) {
 
 static inline int misaligned(const void *m) { return ((uintptr_t)m & 3) != 0; }
 
-/* The shadow for misaligned mutex m, created on first use with m's kind. */
-static pthread_mutex_t *shadow(pthread_mutex_t *m, int create) {
+static inline size_t bucket_of(uintptr_t key) {
+    return (size_t)((key >> 1) ^ (key >> 13)) & (BUCKETS - 1);
+}
+
+/* The shadow for misaligned mutex m, created on first use with m's type.
+   NULL only if the allocation fails. */
+static pthread_mutex_t *shadow(pthread_mutex_t *m) {
     uintptr_t key = (uintptr_t)m;
-    size_t i = (key >> 1) & (TABLE - 1);
+    struct entry **head = &buckets[bucket_of(key)];
     pthread_mutex_t *s = NULL;
     r_lock(&table_lock);
-    for (size_t n = 0; n < TABLE; n++, i = (i + 1) & (TABLE - 1)) {
-        if (table[i].key == key) { s = table[i].shadow; break; }
-        if (table[i].key == 0) {
-            if (!create) break;
+    for (struct entry *e = *head; e; e = e->next)
+        if (e->key == key) { s = &e->shadow; break; }
+    if (!s) {
+        struct entry *e = aligned_alloc(64, (sizeof *e + 63) & ~(size_t)63);
+        if (e) {
             int kind;
-            memcpy(&kind, (char *)m + 16, sizeof kind);      /* __data.__kind */
+            memcpy(&kind, (char *)m + 16, sizeof kind); /* __data.__kind */
             pthread_mutexattr_t a;
             pthread_mutexattr_init(&a);
             pthread_mutexattr_settype(&a, kind & 3);
-            s = aligned_alloc(64, 64);
-            r_init(s, &a);
+            r_init(&e->shadow, &a);
             pthread_mutexattr_destroy(&a);
-            table[i].key = key; table[i].shadow = s;
+            e->key = key;
+            e->next = *head;
+            *head = e;
+            s = &e->shadow;
             if (log_on) fprintf(stderr, "alignmutex: shadow for %p kind %d\n", (void *)m, kind & 3);
-            break;
+        } else if (log_on) {
+            fprintf(stderr, "alignmutex: out of memory for %p\n", (void *)m);
         }
     }
     r_unlock(&table_lock);
     return s;
 }
 
+/* Remove and free m's shadow, if it has one. */
+static void forget(pthread_mutex_t *m) {
+    uintptr_t key = (uintptr_t)m;
+    r_lock(&table_lock);
+    for (struct entry **p = &buckets[bucket_of(key)]; *p; p = &(*p)->next) {
+        if ((*p)->key == key) {
+            struct entry *e = *p;
+            *p = e->next;
+            r_destroy(&e->shadow);
+            free(e);
+            break;
+        }
+    }
+    r_unlock(&table_lock);
+}
+
 int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a) {
     if (!r_init) setup();
-    int rc = r_init(m, a);   /* plain stores; fine at any alignment */
-    if (misaligned(m)) {     /* drop a stale shadow at this address */
-        uintptr_t key = (uintptr_t)m; size_t i = (key >> 1) & (TABLE - 1);
-        r_lock(&table_lock);
-        for (size_t n = 0; n < TABLE && table[i].key; n++, i = (i + 1) & (TABLE - 1))
-            if (table[i].key == key) { r_destroy(table[i].shadow); free(table[i].shadow); table[i].key = 1; break; }
-        r_unlock(&table_lock);
-    }
-    return rc;
+    if (misaligned(m)) forget(m); /* drop a stale shadow at this address */
+    return r_init(m, a);          /* plain stores; fine at any alignment */
 }
 int pthread_mutex_destroy(pthread_mutex_t *m) {
     if (!r_destroy) setup();
-    return misaligned(m) ? 0 : r_destroy(m);
+    if (!misaligned(m)) return r_destroy(m);
+    forget(m);
+    return 0;
 }
 int pthread_mutex_lock(pthread_mutex_t *m) {
     if (!r_lock) setup();
-    return misaligned(m) ? r_lock(shadow(m, 1)) : r_lock(m);
+    if (!misaligned(m)) return r_lock(m);
+    pthread_mutex_t *s = shadow(m);
+    return s ? r_lock(s) : ENOMEM;
 }
 int pthread_mutex_trylock(pthread_mutex_t *m) {
     if (!r_trylock) setup();
-    return misaligned(m) ? r_trylock(shadow(m, 1)) : r_trylock(m);
+    if (!misaligned(m)) return r_trylock(m);
+    pthread_mutex_t *s = shadow(m);
+    return s ? r_trylock(s) : ENOMEM;
 }
 int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *t) {
     if (!r_timedlock) setup();
-    return misaligned(m) ? r_timedlock(shadow(m, 1), t) : r_timedlock(m, t);
+    if (!misaligned(m)) return r_timedlock(m, t);
+    pthread_mutex_t *s = shadow(m);
+    return s ? r_timedlock(s, t) : ENOMEM;
 }
 int pthread_mutex_unlock(pthread_mutex_t *m) {
     if (!r_unlock) setup();
-    return misaligned(m) ? r_unlock(shadow(m, 1)) : r_unlock(m);
+    if (!misaligned(m)) return r_unlock(m);
+    pthread_mutex_t *s = shadow(m);
+    return s ? r_unlock(s) : ENOMEM;
 }
 int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
     if (!r_cwait) setup();
-    return r_cwait(c, misaligned(m) ? shadow(m, 1) : m);
+    if (!misaligned(m)) return r_cwait(c, m);
+    pthread_mutex_t *s = shadow(m);
+    return s ? r_cwait(c, s) : ENOMEM;
 }
 int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *t) {
     if (!r_ctimedwait) setup();
-    return r_ctimedwait(c, misaligned(m) ? shadow(m, 1) : m, t);
+    if (!misaligned(m)) return r_ctimedwait(c, m, t);
+    pthread_mutex_t *s = shadow(m);
+    return s ? r_ctimedwait(c, s, t) : ENOMEM;
 }
